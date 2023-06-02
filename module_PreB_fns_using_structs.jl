@@ -9,25 +9,31 @@ module PreB_fns_using_structs
     using Trapz
     using Distributed 
     using SharedArrays
-
-
+    using PolyChaos
+    using Kronecker
+    using SparseArrays
+    using Base.Threads
     export dependent_params
     export Base_params
+    export Bath_params
+    
+    export heaviside
+    export J
+    export approx_J
+    export LB_current
+    export sim_currents
+    export impurity_current_operator
+    export two_site_current_operator
+    export three_site_current_operator
+    
     export fidelity
     export trace_dist
-    export sim_currents
-    export J_ell
-    export J_box
-    export heaviside
-    export approx_J
-    export LB_three_sites_current
-    export LB_impurity_current
-    export impurity_current_operator
-    export three_site_current_operator
     export Id_check
     export map_check
     export map_check2
     export ρ_test
+    export boundary_test
+
     export system_swaps
     export ancilla_phase_gate_swap
     export ancilla_phase_gate_PH
@@ -39,47 +45,72 @@ module PreB_fns_using_structs
     export ρ_system_corr
     export mp
     export fermionic_swap_gate 
-    export boundary_test
+
     export direct_mapping
     export reaction_mapping
+    export orthopol_chain
     export band_diag
+    
     export reflection_diag
     export U_thermo
     export U_chain
     export chain_to_star
-    export initialise_bath_gates
-    export initialise_system_gates
     export unprime_string
     export unprime_ind
     export JW_string
     export Id_string
+    export entanglement_entropy
+    
+    export diff_sys_init
+    export initialise_bath_gates_therm
+    export initialise_bath_gates_eigen
+    export initialise_system_gates
     export initialise_psi
     export initialise_bath
     export H_S
     export H_bath
+
     export rdm
     export rdm_para
-    export site_change
+    export rdm_para_new
     export enrich_generic3
     export bipart_maxdim
     export Krylov_states
     export Krylov_linkdims
     export linkdims
-    export entanglement_entropy
+    
+    export measure_mem
     export current_time
     export measure_den
     export measure_SvN
     export measure_correlation_matrix
 
-
-
-  
+    export HS_full
+    export lmult
+    export rmult
+    export spin_operators
+    export build_liouvillian
+    export two_site_diss_rates
+    export Liouvillian_solver_exact
+#--------------------------------------------------------------------------------------------------------------------------------------------------
+"""
+MAIN MODULE STRUCTURE:
+-Struct definitions ~80 to 160
+-Currents and spectral density ~160 to 220
+-Test functions ~ 370 to 450
+-NESS calculations ~450 to 770
+-Discretization and mappings ~ 770 to 910
+-Various useful functions ~910 to 1050
+-Initialisation functions ~ 1050 to 1470
+-Enrichment functions ~ 1470 to 1860
+-Measurement functions ~1860 to 1970
+-Master equation functions~1970 to end
+"""
     #--------------------------------------------------------------------------------------------------------------------------
     """
-    Current functions.
+    Parameter structures
     """
-        
-    Base.@kwdef struct Base_params
+    Base.@kwdef mutable struct Base_params
         
         Nbl ::Int64                                    #Number of left bath sites
         Nbr ::Int64                                   #Number of right bath sites
@@ -91,8 +122,8 @@ module PreB_fns_using_structs
         mu_R ::Float64 
         k1 ::Int64                                      # Number of Krylov states
         τ_Krylov ::Float64 
-        Gamma_L ::Float64 
-        Gamma_R ::Float64
+        Γ_L ::Float64 
+        Γ_R ::Float64
         eta ::Float64 
         tdvp_cutoff ::Float64 
 
@@ -103,7 +134,11 @@ module PreB_fns_using_structs
         n1 ::Int64                                      #Number of time steps between each enrichment
         n2 ::Int64                                      #Number of time steps between each extraction of ρΛ
         T ::Float64                                      # Total time
-        T_enrich ::Float64                          
+        T_enrich ::Float64      
+        method ::Int64
+        spec_fun_type ::String 
+        disc_choice ::String   
+        D ::Float64             
     end
 
 
@@ -116,8 +151,6 @@ module PreB_fns_using_structs
         ti ::Vector{Float64}                            #coupling of system modes
         left_bath_bool ::Bool
         right_bath_bool ::Bool
-       # gate_list ::Vector{Any}
-       # H_single ::Matrix{Float64}                         #Create single particle matrix hamiltonian
 
 
         c ::Vector{ITensor}                                 # annihilation operators
@@ -138,29 +171,77 @@ module PreB_fns_using_structs
         nframe ::Int64
         times1 ::Vector{Float64}
         times2 ::Vector{Float64}
+    end
+
+    mutable struct Bath_params
+        Vk_emp_L :: Vector{ComplexF64}
+        ϵb_emp_L :: Vector{ComplexF64}
+        Vk_fill_L :: Vector{ComplexF64}
+        ϵb_fill_L :: Vector{ComplexF64} 
+        fk_L :: Vector{ComplexF64} 
+        Vk_emp_R :: Vector{ComplexF64}
+        ϵb_emp_R :: Vector{ComplexF64}
+        Vk_fill_R :: Vector{ComplexF64}
+        ϵb_fill_R :: Vector{ComplexF64} 
+        fk_R :: Vector{ComplexF64}
         H_single ::Matrix{Float64}
+        H ::MPO
         Ci ::Transpose{ComplexF64, Matrix{ComplexF64}}
+        Bath_params() = new() 
     end
 
-    function fidelity(ρ,σ)
-        ##make sure ρ and σ are in matrix form
-        matrix = sqrt(ρ)*σ*sqrt(ρ)
-        matrix = sqrt(matrix)
-        fid = tr(matrix)*conj(tr(matrix))
-        return fid
-    end
-    
-    function trace_dist(ρ,σ)
-        matrix = (ρ-σ)*(ρ-σ)'
-        matrix = sqrt(matrix)
-        return 0.5*tr(matrix)
-    end
+    heaviside(t) = 0.5 * (sign.(t) .+ 1) 
+#----------------------------------------------------------------------------------------------------------------------------------------------------------
+#-----------------------------------------------------------------------------------------------------------------------------------------------------------
+"""
+Current calculations and spectral functions.
+"""
+    function J(w,spec_therm,side,P)
+        
+        ###Choosing which bath
+        if side =="left"
+            spec_fun_type,Γ,β,μ,D= P.spec_fun_type,P.Γ_L,P.β_L,P.mu_L,P.D
+        elseif side == "right"
+            spec_fun_type,Γ,β,μ,D = P.spec_fun_type,P.Γ_R,P.β_R,P.mu_R,P.D
+        else 
+            error("neither side chosen")
+        end
+        fk = 1 ./(1 .+exp.(β*(w .- μ)))
+        
+        ##Choosing if we incooperate the thermofield transform directly onto the 
+        ##spectral density
+        
+        renorm =1
+        
+        if spec_therm =="filled"
+            renorm = fk
+        elseif spec_therm == "empty"
+            renorm = 1 .-fk
+        elseif spec_therm =="full"
+            renorm = 1
+        else
+            error("No spectral density chosen")
+        end
+        
+        ##Choosing which spectral function to use
+        if spec_fun_type == "box"
+            ρ = (1/(2*D))*(heaviside(w .+ D) .- heaviside(w .- D)).*renorm
+            J =  (Γ*D/π)*ρ
+        elseif spec_fun_type =="ellipse"
+            ρ = real((2/(π*D))*sqrt.(Complex.(1 .-(w/D).^2)).*renorm)
+            J =  (Γ*D/π)*ρ
+        elseif spec_fun_type =="Ohmic"
+            S = parse(Float64,readline("Ohmic power S = "))
 
-    heaviside(t) = 0.5 * (sign.(t) .+ 1)
-    J_ell(w,τ) = real(2*τ*sqrt.(Complex.(1 .-w.^2))/(pi^2))
-    J_box(w,τ) = (τ/2)*(heaviside(w .+ 1) .- heaviside(w .- 1))  
+        else
+            error("No spectral density chosen")
+        end
+        return J
+    end
     
-    function approx_J(J,ϵ_b,V_k,Gamma)
+
+
+    function approx_J(J,ϵ_b,V_k,Γ)
         N = length(ϵ_b)
         η = 1/N
         samp = 10000; # Frequency sampling.
@@ -173,109 +254,99 @@ module PreB_fns_using_structs
            # display(plot(w,delta)) 
             J_approx += delta
         end
-        J_exact = J(w,Gamma)
+        J_exact = J(w,Γ)
         plot(w,J_exact)
         display(plot!(w,J_approx))
     end
 
-    function LB_three_sites_current(P,DP)
-        (;Gamma_L,Gamma_R,mu_L,mu_R,β_L,β_R) = P
+
+    
+    function LB_current(P,DP)
+        (;Γ_L,Γ_R,mu_L,mu_R,β_L,β_R,Ns,spec_fun_type,D,eta) = P
         (;ϵi,ti) = DP
-        ϵ1,ϵ2,ϵ3,t1,t2 = ϵi[1],ϵi[2],ϵi[3],ti[1],ti[2]
-        """
-        Only applicable for the top hat spectral function
-        """
 
+    
         wsamp = 10000; # Frequency sampling.
-        w = range(-1.5,1.5,wsamp); # Frequency axis for Landauer calculations (slightly larger than the band).
+        w = range(-10*D,10*D,wsamp); # Frequency axis for Landauer calculations (slightly larger than the band).
+        Γ = Γ_L+Γ_R
         dw = w[2] - w[1]; # Frequency increment.
+        if spec_fun_type == "box"
+            ρ = (1/(2*D))*(heaviside(w .+ D) .- heaviside(w .- D))
+            Δ_L = (-Γ_L*D/(2*pi*D))*log.((w.-D .+im*eta)./(w .+D .+im*eta))
+            Δ_R = (-Γ_R*D/(2*pi*D))*log.((w.-D .+im*eta)./(w .+D .+im*eta))
+            #Λ = -im*D*Γ*hilbert(ρ)
 
-        ###Ensures the sum doesn't go out of the spectral range.
-        box_fn = (heaviside(w .+ 1) .- heaviside(w .- 1)); 
-
-        prefactor = Gamma_L*Gamma_R*(t1^2)*(t2^2)
-        denom1 = (w .-ϵ1 .+im*Gamma_L/2).*(w.-ϵ2).*((w.-ϵ3.+im*Gamma_R/2))
-        denom2 = (t2^2)*(w.-ϵ1.+im*Gamma_L/2)
-        denom3 = (w.-ϵ3.+im*Gamma_R/2)
-        denom = abs.(denom1.-denom2.-denom3).^2
-        τ_fn = prefactor./denom
+        elseif spec_fun_type =="ellipse"
+            ρ = (2/(π*D))*real(sqrt.(Complex.(1 .-(w/D).^2)))
+            Δ_L = -im*D*Γ_L*hilbert(ρ)
+            Δ_R = -im*D*Γ_R*hilbert(ρ)
+        end
 
         f_L = 1 ./ (1 .+exp.((w .- mu_L)*β_L)); 
         f_R = 1 ./ (1 .+exp.((w .- mu_R)*β_R));
+        
+        ####Calculate determinant of M matrix (Ns x Ns)
+        if Ns == 1
+            Δ = Δ_L + Δ_R
+            detM = w .- ϵi[1] .- Δ
+            G = 1 ./detM
+            A_den = (-1/π).*imag.(G)    
+        elseif Ns == 2
+            detM = (w .-ϵi[2] .-Δ_R).*(w.-ϵi[2].-Δ_R)
+            detM = detM .- abs.(ti[1]^2) 
+            G = ((w .-ϵi[2] .-Δ_R))./detM
+            A_den = (-1/π).*imag.(G)    
+        elseif Ns == 3
+            detM = (w .-ϵi[1] .-Δ_L).*(w.-ϵi[3].-Δ_R).*(w.-ϵi[2])
+            detM = detM - (abs.(ti[2])^2)*(w.-ϵi[1].-Δ_L)
+            detM = detM - (abs.(ti[1])^2)*(w.-ϵi[3].-Δ_R)
+            G =  (w .-ϵi[1] .-Δ_L).*(w.-ϵi[3].-Δ_R)./detM
+            A_den = (-1/π)*imag.(G)
+        end
 
-        Jp = (1/(2*π))*sum(box_fn.*τ_fn.*(f_L - f_R))*dw;
-        Je = (1/(2*π))*sum(box_fn.*w.*τ_fn.*(f_L - f_R))*dw;
-        n = ((Gamma_L+Gamma_R)/(2*π*Gamma_L*Gamma_R))*sum(box_fn.*τ_fn.*(f_L + f_R))*dw;
-        return [Jp,Je,n]
-    end
-
-    function LB_impurity_current(P,DP)
-        """
-        Edits:
-        -Gamma is no longer an input, instead Gamma_L and Gamma_R are.
-        -Changed how box_fn is created.
-        -Need to check for pi factors.
-
-        """
-        (;mu_L,mu_R,β_L,β_R,Gamma_L,Gamma_R,eta) = P
-        epsilon = (DP.ϵi)[1]
-        # Computes the Landauer-Buttiker predictions for the current and density
-        # for a non-interacting dot with energy epsilon coupled identically (strength Gamma/2) 
-        # to two baths with chemical potentials mu and temperatures T. An artifical broadening
-        # eta is included for regularisation.
-
-        # Internal computational parameters:
-        wsamp = 10000; # Frequency sampling.
-        w = range(-1.5,1.5,wsamp); # Frequency axis for Landauer calculations (slightly larger than the band).
-        Gamma = Gamma_L + Gamma_R
-        dw = w[2] - w[1]; # Frequency increment.
-
-        #box function
-        box_fn = (heaviside(w .+ 1) .- heaviside(w .- 1)); 
-
-        # Re-evaluate the Fermi functions for the left and right leads:
+        A = (D*Γ*ρ/π) ./(abs.(detM).^2)
+        if length(ti)>0
+            coupling_factor = prod(abs.(ti).^2)
+            A = A.*coupling_factor
+        end    
         f_L = 1 ./ (1 .+exp.((w .- mu_L)*β_L)); 
         f_R = 1 ./ (1 .+exp.((w .- mu_R)*β_R));
 
-        # Complex-frequency hybridisation function:
-        Delta = (-Gamma/(2*pi))*log.((w.-1 .+im*eta)./(w .+1 .+im*eta));
-
-
-        # Compute the spectral function:
-        A = (-1/pi)*(imag(Delta) .- eta)./((w .- epsilon .- real(Delta)).^2 .+ (imag(Delta) .- eta).^2);
-
-        prefactor = Gamma_L*Gamma_R/(Gamma^2)
+        prefactor = (4*π*D*Γ_L*D*Γ_R)/(2*π*D*Γ)
         # Compute the particle-current, energy-current and density:
-        Jp = prefactor*sum(box_fn.*A.*(f_L - f_R))*dw;
-        Je = prefactor*sum(box_fn.*w.*A.*(f_L - f_R))*dw;
-        n = (1/2)*sum(box_fn.*A.*(f_L + f_R))*dw; 
+        Jp = prefactor*sum(ρ.*A.*(f_L - f_R))*dw;
+        Je = prefactor*sum(ρ.*w.*A.*(f_L - f_R))*dw;
+        n = 0.5*sum(A_den.*(f_L + f_R))*dw; 
         return [Jp,Je,n] 
     end
 
-    function sim_currents(corr,DP,P)
+
+    function sim_currents(corr,DP,P,BP)
         (;Ns) = P
         JL_list = []
         JR_list = []
         den_list = []
-
+        
         for i=1:length(corr)
-            NESS_bool = false
+            anc_bool = true
+            NESS_bool =false
             JL,JR,den = 0,0,0
             if Ns == 1 
-                JL,JR,den = impurity_current_operator(corr[i],DP,P)
-                global Jp = LB_impurity_current(P,DP)[1]
+                JL,JR,den = impurity_current_operator(corr[i],DP,P,BP)
+            elseif Ns ==2
+                JL,JR,den = two_site_current_operator(corr[i],anc_bool,DP,P,BP)
             elseif Ns == 3
-                JL,JR,den = three_site_current_operator(corr[i],NESS_bool,P,DP)
-                global Jp = LB_three_sites_current(P,DP)[1]
+                JL,JR,den = three_site_current_operator(corr[i],NESS_bool,P,DP)    
             end
             push!(JL_list,JL)
             push!(JR_list,JR)
             push!(den_list,den)
         end
-        return JL_list,JR_list,den_list,Jp
+        Jp,_,n = LB_current(P,DP)
+        return JL_list,JR_list,den_list,Jp,n
     end
 
-    function impurity_current_operator(corr,DP,P)
+    function impurity_current_operator(corr,DP,P,BP)
         """
         corr is the N x N correlation matrix for the modes, it is already transposed in the measure correlation
         matrix function. H_single has the opposite orientation. Taking right as the positive direction.
@@ -283,7 +354,8 @@ module PreB_fns_using_structs
         due to the specific derivation used in the daily notes, where the system mode is defined as the end of four chains. 
         """
         (;Nbl) = P
-        (;left_bath_bool,right_bath_bool,H_single) = DP
+        (;left_bath_bool,right_bath_bool) = DP
+        (;H_single) = BP
         ind = 2*Nbl+1
         t = zeros(4)
         JL,JR = 0,0
@@ -303,6 +375,29 @@ module PreB_fns_using_structs
 
         n = corr[ind,ind]
         return[JL,JR,n]
+    end
+
+    function two_site_current_operator(corr,anc_bool,DP,P,BP)
+    """
+    Currently not set up for NESS calculations.
+    """
+    (;H_single) = BP
+    (;Nbl) = P
+    (;ti) = DP
+    if anc_bool
+        step = 2
+    else
+        step = 1 
+    end
+    ind = 2*Nbl+1
+    t1,t2 = H_single[ind-2,ind],H_single[ind-1,ind]
+    JB_L = t1*corr[ind,ind-2] - conj(t1)*corr[ind-2,ind]
+    JA_L = t2*corr[ind,ind-1] - conj(t2)*corr[ind-1,ind]
+    JL = im*(JB_L + JA_L)
+    
+    JR = im*(ti[1]*corr[ind+step,ind] - conj(ti[1])*corr[ind,ind+step])
+    n = corr[ind,ind]
+    return [JL,JR,n]
     end
 
     function three_site_current_operator(corr,NESS_bool,P,DP)
@@ -327,13 +422,25 @@ module PreB_fns_using_structs
         n = corr[ind,ind]
         return [JL,JR,n]
     end
-    #--------------------------------------------------------------------------------------------------------------------------
-
-
+   
     #----------------------------------------------------------------------------------------------------------------------------------
     """
     Test functions
     """
+    
+    function fidelity(ρ,σ)
+        ##make sure ρ and σ are in matrix form
+        matrix = sqrt(ρ)*σ*sqrt(ρ)
+        matrix = sqrt(matrix)
+        fid = tr(matrix)*conj(tr(matrix))
+        return fid
+    end
+    
+    function trace_dist(ρ,σ)
+        matrix = (ρ-σ)*(ρ-σ)'
+        matrix = sqrt(matrix)
+        return 0.5*tr(matrix)
+    end
 
     function Id_check(Λmat)
         n = size(Λmat)[1]
@@ -391,6 +498,14 @@ module PreB_fns_using_structs
         end
     end
 
+    function boundary_test(ψ,N,num_init)
+        left_boundary_test = num_init[1] - expect(ψ,"n")[1]
+        right_boundary_test = num_init[N] - expect(ψ,"n")[N]
+        left_bool = left_boundary_test>1e-5
+        right_bool = right_boundary_test>1e-5
+        return left_bool,right_bool
+    end
+
     #--------------------------------------------------------------------------------------------------------------------------
     """
     NESS calculation and associated functions.
@@ -399,7 +514,7 @@ module PreB_fns_using_structs
         (;Ns) = P
         (;s) = DP
         """
-        This function takes a state where the system and system modes are interleaved
+        This function takes a state where the system and ancilla modes are interleaved
         (with the first system mode at the start site) and swaps the ordering such that 
         indices start:start+Ns-1 are all the system modes and start+Ns:start+2Ns-1 are
         the ancilla modes.
@@ -476,12 +591,9 @@ module PreB_fns_using_structs
     function NESS_fn(ψ,P,DP)
         (;Ns) = P
         (;s,q) = DP
-
         d = 2^Ns
         
         gates =  ancilla_phase_gate_swap(DP,P)
-      #  println("here1")
-      #  @show(varinfo(all=true,sortby= :size,minsize = 1000))
         for i = 1:length(gates)
             ψ = apply(gates[i],ψ)
         end
@@ -491,22 +603,19 @@ module PreB_fns_using_structs
                 ψ = apply(gates[i],ψ)
             end
         end
-       # println("here2")
-       # @show(varinfo(all=true,sortby= :size,minsize = 1000))
+
          ###applies a particle hole transformation to the ancilla states.
         gates =  particle_hole_transform(DP,P)
         for i = 1:length(gates)
             ψ = apply(gates[i],ψ)
         end
-     #   println("here3")
-     #   @show(varinfo(all=true,sortby= :size,minsize = 1000))
+
         ###Applies fermionic swap gates to change the order from interleaved to separated
 
         ψ = system_swaps(ψ,q[1],DP,P)
         qA =  q[Ns+1:2*Ns]
         qS =  q[1:Ns]
-      #  println("here4")
-      #  @show(varinfo(all=true,sortby= :size,minsize = 1000))
+
         rm_inds = [qS ; qA]
         ρf = rdm_para(ψ,rm_inds,DP,P)
         Cs = combiner(s[qS]) # Combiner tensor for merging system legs into a fat index
@@ -515,8 +624,7 @@ module PreB_fns_using_structs
         Csa = combiner([inds(Cs)[1],inds(Ca)[1]])
         ρmat = ρΛ*Csa*Csa'
         ρmat = Matrix(ρmat,inds(ρmat));
-        #println("here5")
-        #@show(varinfo(all=true,sortby= :size,minsize = 1000))
+
         cutoff= 1e-5
         message,bool = ρ_test(ρmat,cutoff)
         if bool
@@ -524,8 +632,7 @@ module PreB_fns_using_structs
         end
         Css = combiner([inds(Cs)[1],inds(Cs)[1]'])
         Caa = combiner([inds(Ca)[1],inds(Ca)[1]'])
-       # println("here6")
-       # @show(varinfo(all=true,sortby= :size,minsize = 1000))
+
         Λmat = d*ρΛ*Css*Caa
         Λmat = Matrix(Λmat,inds(Λmat));
         return ρmat,Λmat
@@ -561,7 +668,7 @@ module PreB_fns_using_structs
             vec = eigen(Λ_list[i]).vectors[:,ind]
 
             ##Calculating correlation matrix for NESS state
-            mat = unvectorise_ρ(vec)
+            mat = unvectorise_ρ(vec,true)
     #         cutoff=1e-10
     #         @show(ρ_test(mat,cutoff)[1])
             corr_NESS = ρ_system_corr(mat,DP,P)
@@ -592,12 +699,13 @@ module PreB_fns_using_structs
 
         return spec_l,vec_l,mat_l,JL_NESS_l,JR_NESS_l,den_NESS_l,fid_l,tr_l
     end
+    
 
     function vectorise_ρ(ψ,P,DP)
         """
         In order for the rdm to be valid here, the ordering of qS and qA must be separated. This function
         assumes that the input state has an interleaved ordering, so the required swap and phase gates are applied.
-
+        
         """
         """
         Do you do the particle hole transform here or not? 
@@ -634,7 +742,7 @@ module PreB_fns_using_structs
         return ρ
     end
 
-    function unvectorise_ρ(ρvec)
+    function unvectorise_ρ(ρvec,norm_bool)
 
         d =  Int(sqrt(length(ρvec)))
         ρ = complex(zeros(d,d))
@@ -643,14 +751,16 @@ module PreB_fns_using_structs
                 ρ[i,j] = ρvec[Int((i-1)*d +j)]
             end
         end
-        ρ = ρ/tr(ρ) ##ensures correct normalisation
-        """
-        Check rho is a valid density matrix
-        """
-        cutoff= 1e-5
-        message,bool = ρ_test(ρ,cutoff)
-        if bool
-            error(message)
+        if norm_bool
+            ρ = ρ/tr(ρ) ##ensures correct normalisation
+            """
+            Check rho is a valid density matrix
+            """
+            cutoff= 1e-5
+            message,bool = ρ_test(ρ,cutoff)
+            if bool
+                error(message)
+            end
         end
         return ρ
     end
@@ -674,7 +784,7 @@ module PreB_fns_using_structs
 
                 C = combiner(s[1:Ns])
                 corr_op = corr_op*C*C'
-                corr_op = Matrix(corr_op,inds(corr_op))
+                corr_op = transpose(Matrix(corr_op,inds(corr_op)))
 
                 corr[i,j] = tr(ρ*corr_op)
             end
@@ -682,13 +792,10 @@ module PreB_fns_using_structs
         return corr
     end
 
-
     function mp(i,j,d)
         ind = (i-1)*d +j
         return ind
     end
-
-
 
     function fermionic_swap_gate(i,j)
 
@@ -717,59 +824,70 @@ module PreB_fns_using_structs
 
         return T
     end
-    #--------------------------------------------------------------------------------------------------------------------------
-
-    function boundary_test(ψ,N,num_init)
-        left_boundary_test = num_init[1] - expect(ψ,"n")[1]
-        right_boundary_test = num_init[N] - expect(ψ,"n")[N]
-        left_bool = left_boundary_test>1e-5
-        right_bool = right_boundary_test>1e-5
-        return left_bool,right_bool
-    end
 
     #--------------------------------------------------------------------------------------------------------------------------------------
     """
     Discretisation mappings and band diagonalisation.
     """
-    function direct_mapping(f,Nb,ϵi,gamma)
+    function direct_mapping(spec_therm,side,DP,P)
         """
         Implements direct discretisation, using simple trapezium integration.
         """
-        samp = 100 # Number of points in mesh.
-        y = LinRange(-1,1,Nb+1)
+        (;D) = P
+        (;ϵi) = DP
+        if side=="left"
+            Nb = P.Nbl
+            ϵ_ref = ϵi[1]
+        elseif side=="right"
+            Nb,Ns = P.Nbr,P.Ns
+            ϵ_ref = ϵi[Ns]
+        else
+            error("No side chosen.")
+        end
+
+        samp = 1000 # Number of points in mesh.
+        y = LinRange(-D,D,Nb+1)
         tsq =  Vector{Float64}(undef,Nb)
         en =  Vector{Float64}(undef,Nb)
         for i =1:Nb
             x = LinRange(y[i],y[i+1],samp)
-            Jx =f(x,gamma)
+            Jx = J(x,spec_therm,side,P)
+            
             tsq[i] = trapz(x,Jx); 
             en[i] = (1/tsq[i])*trapz(x,x.*Jx);
+            
         end
-        ind = sortperm(abs.(en.-ϵi)) 
+        ind = sortperm(abs.(en.-ϵ_ref)) 
         tsq, en = tsq[ind], en[ind];  
         tk = sqrt.(tsq)
         return [tk,en] 
     end
 
 
-    function reaction_mapping(f,Nb,τ)
+    function reaction_mapping(spec_therm,side,P)
         """
         Have to include mapping to a star and the square root before this.
         """
 
+        if side=="left"
+            Nb,method = P.Nbl,P.method
+        elseif side=="right"
+            Nb,method = P.Nbr,P.method
+        else
+            error("No side chosen.")
+        end
         #Define fixed numerness-Cical mesh over [-2,2] to capture spectral function and
         # its hilbert transform correctly within [-1,1].
-        samp = 1000 # Number of points in mesh.
+        samp = 100000 # Number of points in mesh.
         x = LinRange(-2,2,samp);
 
-        Jx =f(x,τ)  # Evaluate symbolic input function over the grid.
+        Jx = J(x,spec_therm,side,P)# Evaluate symbolic input function over the grid.
 
-        Vsq = zeros(1,Nb)
-        en = zeros(1,Nb)
+        Vsq =  Vector{Float64}(undef,Nb)
+        en =  Vector{Float64}(undef,Nb)
         # Loop over the omega intervals and perform integrations:
         Jcur = Jx; # Current bath spectral function.
         for s=1:Nb
-
           # Simple trapezoid integration for hopping squared and on-site energy:
           Vsq[s] = trapz(x,Jcur); 
           en[s] = (1/Vsq[s])*trapz(x,x.*Jcur);
@@ -780,30 +898,51 @@ module PreB_fns_using_structs
         end
 
         Vk = sqrt.(Vsq)
-        #Now we form rotate the bath modes such that we have a star geometry. This is done
-        #by diagonalising the bath modes.
+        if method != 0
+            #Now we form rotate the bath modes such that we have a star geometry. This is done
+            #by diagonalising the bath modes.
 
-        A,U = zeros(Nb+1,Nb+1),zeros(Nb+1,Nb+1)
-        A[1,1],U[1,1] = 1,1
+            A,U = zeros(Nb+1,Nb+1),zeros(Nb+1,Nb+1)
+            A[1,1],U[1,1] = 1,1
 
-        for i =2:Nb+1
-            A[i,i] = en[i-1]
-            A[i-1,i] = Vk[i-1]
-            A[i,i-1] = conj(Vk[i-1])
+            for i =2:Nb+1
+                A[i,i] = en[i-1]
+                A[i-1,i] = Vk[i-1]
+                A[i,i-1] = conj(Vk[i-1])
+            end
+            A_sub = A[2:Nb+1,2:Nb+1]
+            U_sub = eigen(A_sub).vectors
+            U[2:Nb+1,2:Nb+1] = U_sub
+            A_star = U'*A*U
+
+            ###Pretty sure its this way and not [1,2:Nb+1]
+            Vk = A_star[2:Nb+1,1]
+            en = diag(A_star)[2:Nb+1]
         end
-        A_sub = A[2:Nb+1,2:Nb+1]
-        U_sub = eigen(A_sub).vectors
-        U[2:Nb+1,2:Nb+1] = U_sub
-        A_star = U'*A*U
-
-        ###Pretty sure its this way and not [1,2:Nb+1]
-        Vk = A_star[2:Nb+1,1]
-        en = diag(A_star)[2:Nb+1]
-
         return [Vk, en]
     end
 
-
+    
+    function orthopol_chain(spec_therm,side,P)
+    
+        if side=="left"
+            Nb = P.Nbl
+        elseif side=="right"
+            Nb = P.Nbr
+        else
+            error("No side chosen.")
+        end
+        w(t) = J(t, spec_therm, side, P)
+        supp = (-1,1)
+        degree = Nb-1
+        my_meas = Measure("my_meas", w, supp, false, Dict())
+        my_op = OrthoPoly("my_op", degree, my_meas; Nquad=100000);
+        α_coeffs,β_coeffs = coeffs(my_op)[:,1],coeffs(my_op)[:,2]
+        energies = α_coeffs
+        couplings = sqrt.(β_coeffs)
+        
+        return couplings,energies
+    end
 
     function band_diag(B,d)
     # Band-diagonalize matrix B with a bandwidth of d:
@@ -822,7 +961,7 @@ module PreB_fns_using_structs
 
     #------------------------------------------------------------------------------------------------------------------------------------
     """
-    Useful matrix transformations.
+    Useful matrix transformations and ITensor functions.
     """
 
     function reflection_diag(A)
@@ -892,51 +1031,7 @@ module PreB_fns_using_structs
         return A_star
     end
 
-    #---------------------------------------------------------------------------------------------------------------------------------
-    """
-    Initialisation functions for both the initial state and the hamiltonian.
-    """
-
-    function initialise_bath_gates(choice,f_k,start,Nb,cdag,Id)
-
-        """
-        ERROR: The tags of psi are incorrect due to this function.
-        """
-        stop = start + 2*Nb - 2
-
-        if choice == 1
-            gates = [(1-sqrt(f_k[Int((n-1)/2)])*cdag[n]*Id[n+1] + sqrt(f_k[Int((n-1)/2)])*Id[n]*cdag[n+1])/sqrt(2) for n in start:2:stop]; 
-        end
-
-        if choice==2 || choice==3
-
-             gates = [cdag[n]*Id[n+1] for n in start:2:stop]
-        end
-
-        return gates
-    end
-
-    function initialise_system_gates(DP,P)
-        (;Ns,Nbl) = P
-        (;order_bool,cdag,Id) = DP
-        """
-        Only need the pauli strings to start at the first site, i.e. 2*Nbl+1
-        """
-
-
-        start = 2*Nbl+1
-        stop = start +2*Ns - 2
-        if order_bool
-
-            system_gate = [(JW_string(n,start,DP)*cdag[n]*Id[n+1] + JW_string(n+1,start,DP)*cdag[n+1])/sqrt(2) for n in (2*Nbl+1):2:(2*(Ns+Nbl)-1)]
-        ##EDIT
-        else
-            system_gate = [(JW_string(n,start,DP)*cdag[n]*Id_string(n,n+Ns,Id) + JW_string(n+Ns,start,DP)*cdag[n+Ns])/sqrt(2) for n in start:(2*Nbl+Ns)]
-            #system_gate = [(cdag[n]*Id[n+Ns] + Id[n]cdag[n+Ns])/sqrt(2) for n in (2*Nbl+1):(2*Nbl+Ns)]
-        end
-        return system_gate
-    end
-
+    
     function unprime_string(T)
 
         int = 1
@@ -970,8 +1065,6 @@ module PreB_fns_using_structs
         end
         return x
     end 
-
-
     function Id_string(n1,n2,DP)
         """
         Gives an Id string from n1+1 to n2. Note that
@@ -984,6 +1077,99 @@ module PreB_fns_using_structs
             x = Id[i]*x
         end
         return x
+    end
+
+    function entanglement_entropy(ψ)
+        # Compute the von Neumann entanglement entropy across each bond of the MPS
+            N = length(ψ)
+            SvN = zeros(N)
+            psi = ψ
+            for b=1:N
+                psi = orthogonalize(psi, b)
+                if b==1
+                    U,S,V = svd(psi[b] , siteind(psi, b))
+                else
+                    U,S,V = svd(psi[b], (linkind(psi, b-1), siteind(psi, b)))
+                end
+                for n=1:ITensors.dim(S, 1)
+                    p = S[n,n]^2
+                    SvN[b] -= p * log2(p)
+                end
+            end
+            return SvN
+        end;
+    
+
+
+    #---------------------------------------------------------------------------------------------------------------------------------
+    """
+    Initialisation functions for both the initial state and the hamiltonian.
+    """
+    function diff_sys_init(a,b,P,DP)
+        (;Ns,Nbl) = P
+        (;order_bool,cdag,Id) = DP
+        """
+        Only need the pauli strings to start at the first site, i.e. 2*Nbl+1
+        """
+        mag = a^2 +b^2
+        a /= mag
+        b /= mag
+    
+        start = 2*Nbl+1
+        stop = start +2*Ns - 2
+        if order_bool
+    
+            system_gate = [a*(JW_string(n,start,DP)*cdag[n]*Id[n+1] + b*JW_string(n+1,start,DP)*cdag[n+1]) for n in (2*Nbl+1):2:(2*(Ns+Nbl)-1)]
+
+        else
+            system_gate = [(JW_string(n,start,DP)*cdag[n]*Id_string(n,n+Ns,Id) + JW_string(n+Ns,start,DP)*cdag[n+Ns])/sqrt(2) for n in start:(2*Nbl+Ns)]
+        end
+        return system_gate
+    end
+    
+    function initialise_bath_gates_therm(side,P,DP)
+
+        """
+        ERROR: The tags of psi are incorrect due to this function.
+        """
+        (;N,cdag,Id) = DP
+        
+        if side =="left"
+            Nb = P.Nbl
+            start = 1
+        elseif side == "right"
+            Nb = P.Nbr
+            start = N-2*Nb +1
+        else 
+            error("neither side chosen")
+        end
+        stop = start + 2*Nb - 2
+        gates = [cdag[n]*Id[n+1] for n in start:2:stop]
+        return gates
+    end
+
+    function initialise_bath_gates_eigen(side,P,DP)
+        error("Haven't bothered to make this yet in new structure.")
+    end
+
+    function initialise_system_gates(DP,P)
+        (;Ns,Nbl) = P
+        (;order_bool,cdag,Id) = DP
+        """
+        Only need the pauli strings to start at the first site, i.e. 2*Nbl+1
+        """
+
+
+        start = 2*Nbl+1
+        stop = start +2*Ns - 2
+        if order_bool
+            system_gate = [(JW_string(n,start,DP)*cdag[n]*Id[n+1] + JW_string(n+1,start,DP)*cdag[n+1])/sqrt(2) for n in (2*Nbl+1):2:(2*(Ns+Nbl)-1)]
+        ##EDIT
+        else
+            system_gate = [(JW_string(n,start,DP)*cdag[n]*Id_string(n,n+Ns,Id) + JW_string(n+Ns,start,DP)*cdag[n+Ns])/sqrt(2) for n in start:(2*Nbl+Ns)]
+            #system_gate = [(cdag[n]*Id[n+Ns] + Id[n]cdag[n+Ns])/sqrt(2) for n in (2*Nbl+1):(2*Nbl+Ns)]
+        end
+        return system_gate
     end
 
     function initialise_psi(DP,gate_list)
@@ -1000,59 +1186,83 @@ module PreB_fns_using_structs
         return ψ
     end
 
-
-    function initialise_bath(J,side,P,DP,disc_choice,choice)
-
-        (;N,ϵi,cdag,Id) = DP
-        if side =="left"
-            Ns,gamma,Nb,β,mu = P.Ns,P.Gamma_L,P.Nbl,P.β_L,P.mu_L
-            n = 1
-            start = 1
-        elseif side == "right"
-
-            Ns,gamma,Nb,β,mu = P.Ns,P.Gamma_R,P.Nbr,P.β_R,P.mu_R
-            n = Ns
-            start = N-2*Nb +1
-        else 
-            error("neither side chosen")
+    function initialise_bath(side,P,DP,BP)
+        (;disc_choice,method) = P
+    
+    #-----------------------------------------------
+    """
+    This block creates the terms that go into 
+    building the bath hamiltonian.
+    """
+    if side == "left"
+        Vk_emp,ϵb_emp,Vk_fill,ϵb_fill = BP.Vk_emp_L,BP.ϵb_emp_L,BP.Vk_fill_L,BP.ϵb_fill_L
+    elseif side=="right"
+        Vk_emp,ϵb_emp,Vk_fill,ϵb_fill = BP.Vk_emp_R,BP.ϵb_emp_R,BP.Vk_fill_R,BP.ϵb_fill_R
+    else 
+        error("neither side chosen")
+    end
+    (;method) = P
+    if method ==0
+        ch_l = ["empty","filled"]
+    else
+        ch_l = ["full","full"]
+    end
+    
+    if disc_choice == "direct"
+        Vk_emp, ϵb_emp = direct_mapping(ch_l[1],side,DP,P)
+        Vk_fill, ϵb_fill = direct_mapping(ch_l[2],side,DP,P)
+    elseif disc_choice == "reaction"
+        Vk_emp, ϵb_emp = reaction_mapping(ch_l[1],side,P)
+        Vk_fill, ϵb_fill = reaction_mapping(ch_l[2],side,P)
+    elseif disc_choice == "orthopol"
+        Vk_emp, ϵb_emp = orthopol_chain(ch_l[1],side,P)
+        Vk_fill, ϵb_fill = orthopol_chain(ch_l[2],side,P)
+    else
+        error("no discretization chosen")
+    end
+    
+    # """
+    # Reversing the order of the left bath couplings so the last element corresponds to the bath mode
+    # next to the first system mode on the left.
+    # """
+    if side =="left"
+        if method != 3
+            """
+            The reason for this condition is that for the tridiagonal case, the bath modes don't need to be put in 
+            the right order for the MPO for the band diagonalisation of fill_mat and emp_mat. The order is handled after
+            this is done using the reflection_diag function. These arrays don't affect the initialisation of the state
+            for the thermofield case so they don't need to be ordered correctly yet.
+            """
+            Vk_emp = reverse(Vk_emp)
+            Vk_fill = reverse(Vk_fill)
+            ϵb_emp = reverse(ϵb_emp)
+            ϵb_fill = reverse(ϵb_fill)
         end
+    end
+    #--------------------------------------------------------
+    """
+    This block creates the gates needed to create the initial
+    bath state.
+    """
+    if method == 1
+        gates = initialise_bath_gates_eigen(side,P,DP)
+    else
+        gates = initialise_bath_gates_therm(side,P,DP)
+    end
+    #---------------------------------------------------------
 
-
-        if disc_choice == 1
-            Vk, ϵb = direct_mapping(J,Nb,ϵi[n],gamma)
-        elseif disc_choice == 2
-             Vk, ϵb = reaction_mapping(J,Nb,gamma)
-        end
-
-        # """
-        # Reversing the order of the left bath couplings so the last element corresponds to the bath mode
-        # next to the first system mode on the left.
-        # """
-        if side =="left"
-            if choice != 3
-                """
-                The reason for this condition is that for the tridiagonal case, the bath modes don't need to be put in 
-                the right order for the MPO for the band diagonalisation of fill_mat and emp_mat. The order is handled after
-                this is done using the reflection_diag function. These arrays don't affect the initialisation of the state
-                for the thermofield case so they don't need to be ordered correctly yet.
-                """
-                Vk = reverse(Vk)
-                ϵb = reverse(ϵb)
-            end
-        end
-        fk = 1 ./(1 .+exp.(β*(ϵb .- mu)))       # Fermi distributions of the left bath modes  
-        gates = initialise_bath_gates(choice,fk,start,Nb,cdag,Id)
-        return Vk,ϵb,fk,gates
+    return Vk_emp,ϵb_emp,Vk_fill,ϵb_fill,gates
     end
 
 
-    function H_S(P,DP,H_single)
+    function H_S(P,DP,BP)
         """
         This function creates the system hamiltonian, excluding the system
         bath couplings.
         """
         (;Ns,Nbl) = P
         (;ϵi,ti) = DP 
+        (;H_single) = BP
 
         terms = OpSum()
         b = 2*Nbl-1
@@ -1093,7 +1303,8 @@ module PreB_fns_using_structs
 
 
 
-    function H_bath(V_k,ϵb,f_k,side,choice,H_single,DP,P)
+    function H_bath(side,BP,DP,P)
+    
 
         #The following code is not optimised, various objects are created multiple times
         #and within each different option there is identical code which doesn't
@@ -1101,28 +1312,92 @@ module PreB_fns_using_structs
         """
         One way to make this easier to read is to write a separate function for creating a star geometry hamiltonian. 
         """
-        (;N,s) = DP
+        (;method) = P
+        (;N) = DP
+        (;H_single) = BP
+    
         ###Create Hamiltonian MPO 
         terms = OpSum()
         ###Create single particle matrix hamiltonian
-
-
         if side == "left"
             Nb = P.Nbl
+            Vk_emp,ϵb_emp,Vk_fill,ϵb_fill,β,μ = BP.Vk_emp_L,BP.ϵb_emp_L,BP.Vk_fill_L,BP.ϵb_fill_L,P.β_L,P.mu_L
             link_ind = 2*Nb + 1
             start = 1
         elseif side == "right"
             Nb = P.Nbr
+            Vk_emp,ϵb_emp,Vk_fill,ϵb_fill,β,μ = BP.Vk_emp_R,BP.ϵb_emp_R,BP.Vk_fill_R,BP.ϵb_fill_R,P.β_R,P.mu_R
             link_ind = N-2*Nb - 1
             start = (N-2*Nb +1)
         else 
             error("start input is invalid")
         end
         stop = start +2*Nb - 2
-
-
+    
+        fk = 1 ./(1 .+exp.(β*(ϵb_emp.- μ)))
+    
         b = 0
-        if choice ==1
+        if method ==0
+            for j=start:2:stop
+                b += 1
+                """
+                Self energies.
+                """
+                terms += ϵb_fill[b],"n",j                                   # filled mode self energy
+                H_single[j,j] = ϵb_fill[b]
+    
+                terms += ϵb_emp[b],"n",j+1                                 # empty mode self energy
+                H_single[j+1,j+1] =  ϵb_emp[b]
+                
+                """
+                Couplings.
+                """
+                if side =="right"
+                    terms += Vk_fill[b],"Cdag",j-2,"C",j         #hopping from system to kth f mode
+                    H_single[j-2,j] = Vk_fill[b]
+    
+                    terms += conj(Vk_fill[b]),"Cdag",j,"C",j-2      #hopping from kth f mode to system 
+                    H_single[j,j-2] = conj(Vk_fill[b])
+                    if j == start
+                        terms += Vk_emp[b],"Cdag",j-2,"C",j+1        #coupling from system to kth e mode
+                        H_single[j-2,j+1] =  Vk_emp[b]
+                        
+                        terms += conj(Vk_emp[b]),"Cdag",j+1,"C",j-2
+                        H_single[j+1,j-2] = conj(Vk_emp[b])
+                    else
+                        terms += Vk_emp[b],"Cdag",j-1,"C",j+1  #coupling from kth e mode to system
+                        H_single[j-1,j+1] =  Vk_emp[b]
+                    
+                        terms += conj(Vk_emp[b]),"Cdag",j+1,"C",j-1  #coupling from kth e mode to system
+                        H_single[j+1,j-1] =  conj(Vk_emp[b])
+                    end
+                elseif side == "left"
+                    terms += conj(Vk_fill[b]),"Cdag",j,"C",j+2         #hopping from system to kth f mode
+                    H_single[j,j+2] = conj(Vk_fill[b])
+    
+                    terms += Vk_fill[b],"Cdag",j+2,"C",j      #hopping from kth f mode to system 
+                    H_single[j+2,j] = Vk_fill[b]
+                    if j == stop
+                        terms += conj(Vk_emp[b]),"Cdag",j+1,"C",j+2        #coupling from system to kth e mode
+                        H_single[j+1,j+2] =  conj(Vk_emp[b])
+                    
+                        terms += Vk_emp[b],"Cdag",j+2,"C",j+1        #coupling from system to kth e mode
+                        H_single[j+2,j+1] =  Vk_emp[b]
+                    
+                    else
+                        terms += conj(Vk_emp[b]),"Cdag",j+1,"C",j+3  #coupling from kth e mode to system
+                        H_single[j+1,j+3] =  conj(Vk_emp[b])
+                    
+                        terms += Vk_emp[b],"Cdag",j+3,"C",j+1  #coupling from kth e mode to system
+                        H_single[j+3,j+1] =  Vk_emp[b]
+                    end
+                end
+            end
+        end
+        if method ==1
+            Vk = Vk_emp
+            ϵb = ϵb_emp
+            
             print("negative ancilla H = -1, no ancilla H = 0, positive ancilla H = 1")
             HA_choice = parse(Int,readline()) 
             model =  "E basis,"
@@ -1139,75 +1414,81 @@ module PreB_fns_using_structs
                 b += 1
                 terms += ϵb[b],"n",j                                   # bath mode self energy
                 H_single[j,j] = ϵb[b]
-
+    
                 terms += HA_choice*ϵb[b],"n",j+1                       # ancilla bath mode self energy
                 H_single[j+1,j+1] =  HA_choice*ϵb[b]
-
-                terms += V_k[b],"Cdag",j,"C",link_ind                        #hopping from system to kth f mode 
-                H_single[j,link_ind] = V_k[b]
-
-                terms += conj(V_k[b]),"Cdag",link_ind,"C",j                   #hopping from kth f mode to system 
-                H_single[link_ind,j] = conj(V_k[b])
+    
+                terms += conj(V_k[b]),"Cdag",j,"C",link_ind                        #hopping from system to kth f mode 
+                H_single[j,link_ind] = conj(V_k[b])
+    
+                terms += V_k[b],"Cdag",link_ind,"C",j                   #hopping from kth f mode to system 
+                H_single[link_ind,j] = V_k[b]
             end    
         end
-
-        if choice==2
+    
+        if method==2
+            Vk = Vk_emp
+            ϵb = ϵb_emp
+            fk = 1 ./(1 .+exp.(β*(ϵb.- μ)))
             model = "thermofield basis"
             for j=start:2:stop
                 b += 1
                 terms += ϵb[b],"n",j                                   # filled mode self energy
                 H_single[j,j] = ϵb[b]
-
+    
                 terms += ϵb[b],"n",j+1                                 # empty mode self energy
                 H_single[j+1,j+1] =  ϵb[b]
-
-                terms += V_k[b]*sqrt(f_k[b]),"Cdag",j,"C",link_ind            #hopping from system to kth f mode
-                H_single[j,link_ind] = V_k[b]*sqrt(f_k[b])
-
-                terms += conj(V_k[b])*sqrt(f_k[b]),"Cdag",link_ind,"C",j      #hopping from kth f mode to system 
-                H_single[link_ind,j] = conj(V_k[b])*sqrt(f_k[b])
+    
+                terms += conj(Vk[b])*sqrt(fk[b]),"Cdag",j,"C",link_ind            #hopping from system to kth f mode
+                H_single[j,link_ind] = conj(Vk[b])*sqrt(fk[b])
+    
+                terms += Vk[b]*sqrt(fk[b]),"Cdag",link_ind,"C",j      #hopping from kth f mode to system 
+                H_single[link_ind,j] = Vk[b]*sqrt(fk[b])
                 
-                terms += -V_k[b]*sqrt(1-f_k[b]),"Cdag",j+1,"C",link_ind        #coupling from system to kth e mode
-                H_single[j+1,link_ind] =  -V_k[b]*sqrt(1-f_k[b])
+                terms += -conj(Vk[b])*sqrt(1-fk[b]),"Cdag",j+1,"C",link_ind        #coupling from system to kth e mode
+                H_single[j+1,link_ind] =  -conj(Vk[b])*sqrt(1-fk[b])
             
-                terms += -conj(V_k[b])*sqrt(1-f_k[b]),"Cdag",link_ind,"C",j+1  #coupling from kth e mode to system
-                H_single[link_ind,j+1] =  -conj(V_k[b])*sqrt(1-f_k[b])
+                terms += -Vk[b]*sqrt(1-fk[b]),"Cdag",link_ind,"C",j+1  #coupling from kth e mode to system
+                H_single[link_ind,j+1] =  -Vk[b]*sqrt(1-fk[b])
             end
         end
-
-        if choice ==3
+    
+        if method ==3
+            Vk = Vk_emp
+            ϵb = ϵb_emp
+            fk = 1 ./(1 .+exp.(β*(ϵb.- μ)))
             model = "thermofield+tridiag"
             fill_mat = zeros(Nb+1,Nb+1)
             emp_mat = zeros(Nb+1,Nb+1)
-            ### Same terms as for choice 2, inputed as a matrix rather than an MPO. 
+            ### Same terms as for method 2, inputed as a matrix rather than an MPO. 
             for j=1:Nb
                 ###This loop creates two (Nb+1) x (Nb+1) matrices, one includes the couplings and self energies of the 
                 ###filled modes and the system, the other the empty modes and the system. These are then tridiagonalised 
                 ###separately in the next loop, and their elements are used to construct the MPO for the hamiltonian in this new, tridiagonal basis. 
-
+    
                 """
                 Pretty sure the first entry doesn't effect the diagonalisation so I set it to zero for both.
                 """
                 fill_mat[1,1],emp_mat[1,1] = 0, 0
-
+    
                 fill_mat[j+1,j+1],emp_mat[j+1,j+1] = ϵb[j],ϵb[j]
-
-                fill_mat[j+1,1] = V_k[j]*sqrt(f_k[j])
-
-                fill_mat[1,j+1] = conj(V_k[j])*sqrt(f_k[j])
-
-                emp_mat[j+1,1] = -V_k[j]*sqrt(1-f_k[j])
-
-                emp_mat[1,j+1] = -conj(V_k[j])*sqrt(1-f_k[j])
+    
+                fill_mat[j+1,1] = conj(Vk[j])*sqrt(fk[j])
+    
+                fill_mat[1,j+1] = Vk[j]*sqrt(fk[j])
+    
+                emp_mat[j+1,1] = -conj(Vk[j])*sqrt(1-fk[j])
+    
+                emp_mat[1,j+1] = -Vk[j]*sqrt(1-fk[j])
             end
-
+    
             fill_mat,Uf = band_diag(fill_mat,1)
             emp_mat,Ue = band_diag(emp_mat,1)
-
+    
             ###discarding the system terms as the system isn't mixed in this transformation.
             Uf = Uf[2:Nb+1,2:Nb+1] 
             Ue = Ue[2:Nb+1,2:Nb+1]
-
+    
             b = 1
             if side == "left"
                 ##flipping the matrices so the modes closest to the system
@@ -1218,62 +1499,111 @@ module PreB_fns_using_structs
                 #these matrices, we don't skip over this at the start of the next loop
                 b = 0 
             end
-
+    
             for j=start:2:stop
                 b += 1
                 terms += fill_mat[b,b],"n",j
                 H_single[j,j] = fill_mat[b,b]
-
+    
                 terms += emp_mat[b,b],"n",j+1
                 H_single[j+1,j+1] = emp_mat[b,b]
                 if side =="right"
                     terms += fill_mat[b-1,b],"Cdag",j-2,"C",j
                     H_single[j-2,j] = fill_mat[b-1,b]
-
+    
                     terms += fill_mat[b,b-1],"Cdag",j,"C",j-2
                     H_single[j,j-2] = fill_mat[b,b-1]
-
+    
                     if j == start 
                         terms += emp_mat[b-1,b],"Cdag",j-2,"C",j+1
                         H_single[j-2,j+1] = emp_mat[b-1,b]
-
+    
                         terms += emp_mat[b,b-1],"Cdag",j+1,"C",j-2
                         H_single[j+1,j-2] = emp_mat[b,b-1]    
                     else             
                         terms += emp_mat[b-1,b],"Cdag",j-1,"C",j+1
                         H_single[j-1,j+1] = emp_mat[b-1,b]
-
+    
                         terms += emp_mat[b,b-1],"Cdag",j+1,"C",j-1
                         H_single[j+1,j-1] = emp_mat[b,b-1]
                     end
-                elseif side =="left"      
+                else side =="left"      
                     """
                     CHECK THAT THIS ORDER IS CORRECT, I.E WHETHER THE J AND J+2 
                     SHOULD BE SWITCHED
                     """
                     terms += fill_mat[b,b+1],"Cdag",j,"C",j+2
                     H_single[j,j+2] = fill_mat[b,b+1]
-
+    
                     terms += fill_mat[b+1,b],"Cdag",j+2,"C",j
                     H_single[j+2,j] = fill_mat[b+1,b]
                     if j == stop
                         terms += emp_mat[b,b+1],"Cdag",j+1,"C",j+2
                         H_single[j+1,j+2] = emp_mat[b,b+1]
-
+    
                         terms += emp_mat[b+1,b],"Cdag",j+2,"C",j+1
                         H_single[j+2,j+1] = emp_mat[b+1,b]
                     else
                         terms += emp_mat[b,b+1],"Cdag",j+1,"C",j+3
                         H_single[j+1,j+3] = emp_mat[b,b+1]
-
+    
                         terms += emp_mat[b+1,b],"Cdag",j+3,"C",j+1
                         H_single[j+3,j+1] = emp_mat[b+1,b]
                     end
                 end
             end
         end
-
+    
         return  terms,H_single
+        end
+#------------------------------------------------------------------------------------------------------------------------------------------------------------------
+"""
+Enrichment functions
+"""
+    function rdm_para_old(ψ,rm_inds,DP,P)
+        (;Ns) = P
+        (;s,N) = DP
+        
+        ψdag = dag(ψ)
+        ITensors.prime!(linkinds, ψdag)
+        ##Initialises an empty ITensor and an array with the same dimensions. The reason for creating an array
+        ##is that you can pass a vector of indices to an array, but I can't work out how to do the same for an ITensor.
+        rdm_ = ITensor(s[rm_inds],s[rm_inds]')
+        rdm_arr = Array{ComplexF64}(rdm_,s[rm_inds],s[rm_inds]') 
+        rdm_arr = SharedArray(rdm_arr)
+        ##This loop iterates over the hilbert space of the reduced density matrix, which is given by 2^(2*Ns)
+        #
+        N_inds = length(rm_inds)
+        lk = ReentrantLock()
+        @sync @distributed for i=0:(2^(2*N_inds)-1)
+            ##This converts the single index of the state into a vector of indices for each leg. 
+            sys_inds = bitstring(Int16(i))
+            sys_inds = split(sys_inds,"") 
+            n = length(sys_inds)
+            x =  ([parse(Int8,sys_inds[k]) for k in (16-2*N_inds+1):16] .+1)
+            b = 0
+            ρ =  ψdag[1]*ψ[1]        
+            for j in 2:N
+                if j in rm_inds
+                    b +=1
+                    ##The first 2Ns indices are taken as s[q] and the last 2Ns indices are taken as s[q]'.
+                    ##I'm deliberately contracting ψdag[j] and ψ[j] with ρ separately to prevent creating a tensor of size
+                    ##χ^4 with χ being the local bond dimension. The largest tensor created is of size \chi^2*d where d is the site dimension (2).
+                    C1 = ψdag[j]*onehot(s[j]=>x[b]) 
+                    C2 = ψ[j]*onehot(s[j]=>x[b+N_inds])  
+                    ρ = ρ*C1
+                    ρ = ρ*C2
+                else
+                    ρ = ρ* ψdag[j]
+                    ρ = ρ* ψ[j]
+                end
+            end
+            ##This sets the element rdm_arr[inds=x] as ρ.
+            rdm_arr[CartesianIndex(Tuple(x))] = ρ[1]
+            GC.gc()
+        end
+        rdm_ = ITensor(rdm_arr,s[rm_inds],s[rm_inds]')
+        return rdm_
     end
 
     function rdm_para(ψ,rm_inds,DP,P)
@@ -1287,16 +1617,17 @@ module PreB_fns_using_structs
         rdm_ = ITensor(s[rm_inds],s[rm_inds]')
         rdm_arr = Array{ComplexF64}(rdm_,s[rm_inds],s[rm_inds]') 
         rdm_arr = SharedArray(rdm_arr)
-        ##This loop iterates over the hilbert space of the reduced density matrix, which is given by 2*2*Ns
+        ##This loop iterates over the hilbert space of the reduced density matrix, which is given by 2^(2*Ns)
         #
         N_inds = length(rm_inds)
-        @sync @distributed for i=0:(2^(2*N_inds)-1)
+        lk = ReentrantLock()
+        @threads for i=0:(2^(2*N_inds)-1)
     
             ##This converts the single index of the state into a vector of indices for each leg. 
             sys_inds = bitstring(Int16(i))
             sys_inds = split(sys_inds,"") 
             n = length(sys_inds)
-            x =  ([parse(Int8,sys_inds[k]) for k in (n-2*N_inds+1):n] .+1)
+            x =  ([parse(Int8,sys_inds[k]) for k in (16-2*N_inds+1):16] .+1)
             b = 0
             ρ =  ψdag[1]*ψ[1] 
                     
@@ -1318,13 +1649,16 @@ module PreB_fns_using_structs
             end
             
             ##This sets the element rdm_arr[inds=x] as ρ.
-            rdm_arr[CartesianIndex(Tuple(x))] = ρ[1]
-            
+            lock(lk) do
+                rdm_arr[CartesianIndex(Tuple(x))] = ρ[1]
+            end
         end
     
         rdm_ = ITensor(rdm_arr,s[rm_inds],s[rm_inds]')
         return rdm_
     end
+
+    
 
     function rdm(ψ,rm_inds,DP,P)
         (;Ns) = P
@@ -1376,8 +1710,6 @@ module PreB_fns_using_structs
         return rdm_
     end
 
-   
-
     # function rdm(ψ,DP)
     #     (;N,q) = DP
     #     ψdag = dag(ψ) # Complex conjugate MPS
@@ -1397,16 +1729,7 @@ module PreB_fns_using_structs
     #     return ρ
     # end
 
-    function site_change(ψ_init,ψf,ind)
 
-        a,b = zeros(n),zeros(n)
-        a,b = complex(a),complex(b)
-        for i=1:n
-            a[i]=ψ_init[ind][i]
-            b[i]=ψf[ind][i]
-        end
-        return norm(a-b)
-    end
 
     function enrich_generic3(ϕ, ψ⃗; P, kwargs...)
         (;Kr_cutoff) = P
@@ -1463,16 +1786,16 @@ module PreB_fns_using_structs
           lefttags = tags(linkind(ϕ, n - 1)),
           righttags = tags(linkind(ϕ, n - 1)))   
 
-        x = dim(inds(S)[1])
-        @assert(x == dim(linkind(ϕ, n - 1)))
+        x = ITensors.dim(inds(S)[1])
+        @assert(x == ITensors.dim(linkind(ϕ, n - 1)))
         r = uniqueinds(Vϕ, S) # Indices of density matrix
         lϕ = commonind(S, Vϕ) # Inner link index from density matrix diagonalization
 
 
         # Compute the theoretical maximum bond dimension that the enriched state cannot exceed:
-        abs_maxdim = bipart_maxdim(s,n - 1) - dim(lϕ)
+        abs_maxdim = bipart_maxdim(s,n - 1) - ITensors.dim(lϕ)
         # Compute the number of eigenvectors of ɸ's projected density matrix to retain:
-        Kry_linkdim_vec = [dim(linkind(ψᵢ, n - 1)) for ψᵢ in ψ⃗]
+        Kry_linkdim_vec = [ITensors.dim(linkind(ψᵢ, n - 1)) for ψᵢ in ψ⃗]
 
 
         ω_maxdim = min(sum(Kry_linkdim_vec),abs_maxdim)
@@ -1485,8 +1808,8 @@ module PreB_fns_using_structs
             rdim = 1
             for iv in r
               IDv = ITensor(dag(iv)', iv);
-              rdim *= dim(iv)
-              for i in 1:dim(iv)
+              rdim *= ITensors.dim(iv)
+              for i in 1:ITensors.dim(iv)
                 IDv[iv' => i, iv => i] = 1.0
               end      
               ID = ID*IDv
@@ -1501,11 +1824,11 @@ module PreB_fns_using_structs
 
 
                 Dp, Vp, spec_P = eigen(
-                      P, r', r;
+                      P, r', r,
                       ishermitian=true,
                       tags="P space",
                       cutoff=1e-1,
-                      maxdim=rdim-dim(lϕ),             ###potentially wrong
+                      maxdim=rdim-ITensors.dim(lϕ),             ###potentially wrong
                       kwargs...,
                     )
 
@@ -1543,7 +1866,7 @@ module PreB_fns_using_structs
              lnew = lϕ
 
         end
-        @assert dim(linkind(ϕ, n - 1)) - dim(lϕ) <=0
+        @assert ITensors.dim(linkind(ϕ, n - 1)) - ITensors.dim(lϕ) <=0
         # Update the enriched state
         phi[n] = V
 
@@ -1579,19 +1902,19 @@ module PreB_fns_using_structs
     #     left_maxdim = 1
     #     for k=1:n
     #         @show(left_maxdim)
-    #         left_maxdim *= 2#dim(s[k])
+    #         left_maxdim *= 2#ITensors.dim(s[k])
     #         @show(left_maxdim)
     #         if left_maxdim ==0
     #           #  @show(s[k])
-    #            # @show(dim(s[k]))
+    #            # @show(ITensors.dim(s[k]))
     #         end
     #     end
     #     right_maxdim = 1
     #     for k=(n+1):length(s)
-    #         right_maxdim *= 2#dim(s[k])
+    #         right_maxdim *= 2#ITensors.dim(s[k])
     #         if right_maxdim ==0
     #             @show(s[k])
-    #             @show(dim(s[k]))
+    #             @show(ITensors.dim(s[k]))
     #         end
     #     end
         left_maxdim = 2^n
@@ -1668,35 +1991,29 @@ module PreB_fns_using_structs
       linkdims = zeros(length(ψ)-1,1)
       for b in eachindex(ψ)[1:(end - 1)]
         l = linkind(ψ, b)
-        linkdims[b] = isnothing(l) ? 1 : dim(l)
+        linkdims[b] = isnothing(l) ? 1 : ITensors.dim(l)
       end
       return linkdims
     end
 
 
-
-    function entanglement_entropy(ψ)
-    # Compute the von Neumann entanglement entropy across each bond of the MPS
-        N = length(ψ)
-        SvN = zeros(N)
-        psi = ψ
-        for b=1:N
-            psi = orthogonalize(psi, b)
-            if b==1
-                U,S,V = svd(psi[b] , siteind(psi, b))
-            else
-                U,S,V = svd(psi[b], (linkind(psi, b-1), siteind(psi, b)))
-            end
-            for n=1:dim(S, 1)
-                p = S[n,n]^2
-                SvN[b] -= p * log2(p)
-            end
-        end
-        return SvN
-    end;
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+"""
+Observer functions
+"""
 
 
     ###Observer functions
+    """
+    Memory observer function from https://itensor.discourse.group/t/memory-usage-in-dmrg-julia/562/4
+    """
+    function measure_mem(; bond, half_sweep, psi, kwargs...)    
+        if bond==1 && half_sweep==2
+          psi_size =  Base.format_bytes(Base.summarysize(psi))
+          println("|psi| = $psi_size")
+        end
+    end
+    
     function current_time(; current_time, bond, half_sweep)
       if bond == 1 && half_sweep == 2
         return real(im*current_time)
@@ -1724,11 +2041,145 @@ module PreB_fns_using_structs
         end
         return nothing
     end
-    function measure_mem!(; psi,bond,half_sweep,projected_operator)
-        if bond==1 && half_sweep == 2
-            psi_size =  Base.format_bytes(Base.summarysize(psi))
-            PH_size =  Base.format_bytes(Base.summarysize(projected_operator))
-            println("|psi| = $psi_size, |PH| = $PH_size")
+
+
+    function HS_full(P,DP,BP)
+        """
+        Note that at this point, only system sites remain. 
+        While technically s[1:Ns] will probably be bath modes,
+        in this function these indices are just used as labels so
+        it doesn't matter.
+        """
+        (;Ns,Nbl) = P
+        (;s,c,cdag,qS) = DP
+        (;H_single) = BP
+        HS_single = BP.H_single[qS,qS]
+        d = 2^Ns
+        HS = complex(zeros(d,d))
+        for i=1:Ns
+            for j=1:Ns
+                ##create the creation and annihilation in MPO form
+                aj_dag = JW_string(j,1,DP)*cdag[j]*Id_string(j,Ns,DP)
+                ai = JW_string(i,1,DP)*c[i]*Id_string(i,Ns,DP)
+                corr_op = apply(aj_dag,ai)
+    
+                C = combiner(s[1:Ns])
+                corr_op = corr_op*C*C'
+                corr_op = transpose(Matrix(corr_op,inds(corr_op)))
+                HS += HS_single[i,j]*corr_op
+            end
         end
+        return HS
     end
+    
+    function lmult(A)
+        ##Super-operator representing left-multiplication on a vectorised density matrix
+        d = size(A)[1]
+        Id = 1.0*Matrix(I, d, d)
+        return kronecker(transpose(A),Id)
+    end
+    function rmult(A)
+        ##Super-operator representing left-multiplication on a vectorised density matrix
+        d = size(A)[1]
+        Id = 1.0*Matrix(I, d, d)
+        return kronecker(Id,A)
+    end
+    
+    function spin_operators(M)
+    
+        # Build sparse matrix version of basic spin (Pauli) operators :
+        sp = spdiagm(2,2,1=>ones(1))
+        sm = spdiagm(2,2,-1=>ones(1))
+        sz = spdiagm(2,2,0=>[1;-1]);
+        num = spdiagm(2,2,0=>[0;1])
+        # Notice there are NO factors of (1/2) for spin-1/2 included here.
+        
+        # Construct spin operators for each spin in the full Hilbert space :
+        Sz = Vector{Any}(undef, M)
+        Sp = Vector{Any}(undef, M)
+        Sm = Vector{Any}(undef, M)
+        Num = Vector{Any}(undef,M)
+        for m=1:M
+            Sz[m] = kronecker(kronecker(spdiagm(2^(m-1),2^(m-1),0=>ones(2^(m-1))),sz),spdiagm(2^(M-m),2^(M-m),0=>ones(2^(M-m))));
+            Sp[m] = kronecker(kronecker(spdiagm(2^(m-1),2^(m-1),0=>ones(2^(m-1))),sp),spdiagm(2^(M-m),2^(M-m),0=>ones(2^(M-m))));
+            Sm[m] = kronecker(kronecker(spdiagm(2^(m-1),2^(m-1),0=>ones(2^(m-1))),sm),spdiagm(2^(M-m),2^(M-m),0=>ones(2^(M-m))));
+            Num[m] = kronecker(kronecker(spdiagm(2^(m-1),2^(m-1),0=>ones(2^(m-1))),num),spdiagm(2^(M-m),2^(M-m),0=>ones(2^(M-m))));
+        end
+        return Sz,Sp,Sm,Num
+    end
+    
+    function build_liouvillian(H,Sp,Sm,Sz,Num,Ge,Gd,M)
+    
+        L = -1im*(rmult(H) - lmult(H)); # Coherent part: -i(H rho - rho H) = -i[H,rho]
+        La = 0*L; Lb = 0*L; JL = 0*L; JR = 0*L;
+        Zf = 0 
+        for m=1:M
+            # Build JW string:
+            Z = 1.0*Matrix(I, 2^M, 2^M)
+            for q=1:(m-1)
+                Z = Z*Sz[q];
+            end
+            @show(size(Sm[m]))
+            @show(size(Z))
+            # The single-site spin flip with JW string = injection/ejection of spinless fermions:
+            La = La + Ge[m]*(rmult(Sm[m]*Z)*lmult(Z*Sp[m]) - (1/2)*rmult((Sp[m])*Sm[m]) - (1/2)*lmult((Sp[m])*Sm[m]));
+            Lb = Lb + Gd[m]*(rmult(Sp[m]*Z)*lmult(Z*Sm[m]) - (1/2)*rmult((Sm[m])*Sp[m]) - (1/2)*lmult((Sm[m])*Sp[m]));
+            if m==M
+                Zf = Z
+            end
+        end
+        L = L + La + Lb
+        JL_op = Ge[1]*(rmult(Sm[1])*lmult(Sp[1]) - (1/2)*rmult((Sp[1])*Sm[1]) - (1/2)*lmult((Sp[1])*Sm[1])) +
+                Gd[1]*(rmult(Sp[1])*lmult(Sm[1]) - (1/2)*rmult((Sm[1])*Sp[1]) - (1/2)*lmult((Sm[1])*Sp[1]))
+        JL_op = lmult(Num[1])*JL_op        
+        JR_op = Ge[M]*(rmult(Sm[M]*Zf)*lmult(Zf*Sp[M]) - (1/2)*rmult((Sp[M])*Sm[M]) - (1/2)*lmult((Sp[M])*Sm[M])) +
+                Gd[M]*(rmult(Sp[M]*Zf)*lmult(Zf*Sm[M]) - (1/2)*rmult((Sm[M])*Sp[M]) - (1/2)*lmult((Sm[M])*Sp[M]))
+        JR_op = -lmult(Num[M])*JR_op  
+        return L,JL_op,JR_op
+    end
+    
+    function two_site_diss_rates(P,DP)
+        
+        (;Ns,Γ_L,Γ_R,β_L,β_R,mu_L,mu_R) = P
+        (;ϵi) = DP
+        f_L = 1 /(1 +exp(β_L*(ϵi[1] - mu_L)))
+        f_R = 1 /(1 +exp(β_R*(ϵi[Ns] - mu_R)))
+        ##prefactor is due to the different defs of gammas compared to the review paper.
+        fs = complex(zeros(Ns))
+        Γs = complex(zeros(Ns))
+        fs[1],fs[Ns]=f_L,f_R
+        Γs[1],Γs[Ns] = (4/π)*Γ_L,(4/π)*Γ_R
+        Ge = Γs.*fs
+        Gd = Γs.*(1 .-fs)
+        return Ge,Gd
+    end
+    
+    function Liouvillian_solver_exact(L,tvec,ρ0)
+        """
+        Taken from https://stackoverflow.com/questions/56214666/left-and-right-eigenvectors-in-julia.
+        This represents equations 177-179 in "Non-equilibrium boundary driven quantum systems: models, methods and
+        properties, Gabriel T. Landi,1, ⇤ Dario Poletti,2, † and Gernot Schaller3,"
+        """
+        println("here1")
+        ρ_list = Any[]
+        α = size(L)[1]
+        F = eigen(L)
+        Q = eigvecs(F) # right eigenvectors 
+        QL = inv(eigvecs(F)) # left eigenvectors 
+        Λ = eigvals(F)
+        ρ_ness = Q[:,length(Λ)]
+        
+        push!(ρ_list,ρ0)
+        for i=1:length(tvec)
+            ρt = complex(0*copy(ρ0))
+            for α=1:size(L)[1]
+                c_α= sum(QL[α,:].*ρ0)
+                mode_α = c_α*exp(Λ[α]*tvec[i])*Q[:,α]
+                ρt += mode_α
+            end
+            push!(ρ_list,ρt)
+        end
+        return ρ_list,Λ,ρ_ness
+    end
+    
 end
